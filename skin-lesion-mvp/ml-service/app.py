@@ -8,6 +8,8 @@ from collections import Counter
 import json
 import warnings
 import argparse
+import numpy as np
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # Define class names and info
@@ -48,7 +50,7 @@ CLASS_INFO = {
     },
     'mel': {
         'display': 'Melanoma',
-        'risk': 'Very High',
+        'risk': 'High',
         'description': 'A serious form of skin cancer that can spread if not treated early.',
         'recommendation': 'Seek immediate medical attention.'
     },
@@ -172,62 +174,61 @@ def preprocess_image(image_path, device):
         return None
 
 def predict(image_path, loaded_models, device):
-    """Predict skin lesion from image file"""
+    """Predict skin lesion from image file (ensemble = mean of probabilities)."""
     if not loaded_models:
         print("Error: No models loaded for prediction")
         return None
-        
+
     # Preprocess image
     image_tensor = preprocess_image(image_path, device)
     if image_tensor is None:
         return None
-    
-    # Get predictions from each model
-    predictions = {}
-    overall_probs = {i: 0.0 for i in range(7)}
-    
-    with torch.no_grad():  # No need to track gradients
+
+    predictions = {}                       # per-backbone predictions
+    num_classes = 7
+    sum_probs = np.zeros(num_classes, dtype=np.float32)
+
+    with torch.no_grad():
         for model_name, model in loaded_models.items():
-            # Get model output
-            output = model(image_tensor)
-            probs = F.softmax(output, dim=1)[0].cpu().numpy()
-            
-            # Get predicted class
-            pred_class = int(probs.argmax())
-            pred_confidence = float(probs[pred_class])
-            
-            # Store prediction
+            logits = model(image_tensor)
+            probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()  # shape [7]
+            pred_idx = int(probs.argmax())
+
             predictions[model_name] = {
-                "class_id": pred_class,
-                "class_name": CLASS_NAMES[pred_class],
-                "confidence": pred_confidence
+                "class_id": pred_idx,
+                "class_name": CLASS_NAMES[pred_idx],
+                "confidence": float(probs[pred_idx]),   # 0..1 for this backbone
             }
-            
-            # Add to overall probabilities
-            for i, prob in enumerate(probs):
-                overall_probs[i] += float(prob) / len(loaded_models)
-    
-    # Ensemble prediction using majority voting
-    pred_classes = [pred["class_id"] for pred in predictions.values()]
-    counter = Counter(pred_classes)
-    ensemble_class = counter.most_common(1)[0][0]
-    ensemble_class_name = CLASS_NAMES[ensemble_class]
-    
-    # Format result
+
+            sum_probs += probs
+
+    # ---- Ensemble by averaging probabilities (not voting) ----
+    n_models = max(1, len(loaded_models))
+    ens_probs = (sum_probs / n_models).astype(float)            # shape [7], sums ~1
+    top_idx = int(ens_probs.argmax())
+    top_label = CLASS_NAMES[top_idx]
+    top_prob = float(ens_probs[top_idx])                        # 0..1
+
+    # (Optional) agreement: fraction of models that chose the ensemble top class
+    agreement = sum(1 for v in predictions.values() if v["class_id"] == top_idx) / n_models
+
+    class_probs = {CLASS_NAMES[i]: float(ens_probs[i]) for i in range(num_classes)}
+    info = CLASS_INFO.get(top_label, {})
+
     result = {
         "prediction": {
-            "class_id": ensemble_class,
-            "class_name": ensemble_class_name,
-            "display_name": CLASS_INFO[ensemble_class_name]["display"],
-            "risk": CLASS_INFO[ensemble_class_name]["risk"],
-            "description": CLASS_INFO[ensemble_class_name]["description"],
-            "recommendation": CLASS_INFO[ensemble_class_name]["recommendation"],
-            "confidence": counter[ensemble_class] / len(loaded_models)  # Percentage of models that voted for this class
+            "class_id": top_idx,
+            "class_name": top_label,
+            "display_name": info.get("display", top_label),
+            "risk": info.get("risk", "Low"),
+            "description": info.get("description", ""),
+            "recommendation": info.get("recommendation", ""),
+            "confidence": top_prob,        # <-- now TRUE confidence from ensemble (0..1)
+            "agreement": agreement,        # <-- optional, shows model consensus (0..1)
         },
-        "model_predictions": predictions,
-        "class_probabilities": {CLASS_NAMES[i]: float(prob) for i, prob in overall_probs.items()}
+        "model_predictions": predictions,  # per-backbone outputs
+        "class_probabilities": class_probs # ensemble distribution used for the bars
     }
-    
     return result
 
 def main():
@@ -306,5 +307,60 @@ def main():
         json.dump(result, f, indent=4)
     print(f"\nResults also saved to {output_filename}")
 
+# ==== FASTAPI INTEGRATION WRAPPER (add this) ====
+# CHANGE: Keep models in memory for repeated API calls
+from PIL import Image as _PilImage
+import tempfile as _temp
+import os as _os
+
+# Global cache for models/device
+_LOADED_MODELS = None
+_DEVICE = None
+
+def _ensure_loaded():
+    """Load models once and reuse (idempotent)."""
+    global _LOADED_MODELS, _DEVICE
+    if _LOADED_MODELS is None:
+        # CHANGE: allow MODELS_DIR override via env; default to ./models next to this file
+        script_dir = _os.path.dirname(_os.path.abspath(__file__))
+        models_dir = _os.environ.get("MODELS_DIR", _os.path.join(script_dir, "models"))
+        _LOADED_MODELS, _DEVICE = load_models(models_dir=models_dir)
+
+def predict_image(image: _PilImage.Image, user_id=None, meta=None):
+    """
+    CHANGE: FastAPI will call this version with a PIL Image.
+    We save to a temp file and reuse your existing `predict(image_path, loaded_models, device)`.
+    """
+    _ensure_loaded()
+    if _LOADED_MODELS is None:
+        raise RuntimeError("Models failed to load; check MODELS_DIR and weight files.")
+
+    # Save PIL image to a temporary file so we can reuse your preprocess path
+    tmp_path = None
+    try:
+        with _temp.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            image_rgb = image.convert("RGB")
+            image_rgb.save(tmp.name, format="JPEG", quality=95)
+            tmp_path = tmp.name
+
+        # Call your original predictor (ensemble) – returns the final dict your UI expects
+        result = predict(tmp_path, _LOADED_MODELS, _DEVICE)
+
+        # (Optional) attach passthrough info
+        if isinstance(result, dict):
+            if user_id is not None:
+                result["user_id"] = user_id
+            if meta is not None:
+                result["meta"] = meta
+
+        return result
+    finally:
+        # Clean up the temp file
+        if tmp_path:
+            try:
+                _os.remove(tmp_path)
+            except Exception:
+                pass
+# ==== END WRAPPER ====
 if __name__ == "__main__":
     main()
